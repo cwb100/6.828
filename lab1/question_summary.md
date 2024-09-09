@@ -369,7 +369,7 @@ $5 = (void *) 0xf010ffd8
 
 可以看到，这里堆栈指针和ebp的值
 
-我们也可以使用info stack来查看调用关系。
+我们也可以使用info stack来查看调用关系。结合上面我们得到的ebp的值来看，可以看到ebp的值等于下面函数调用栈中的test_backtrace的bootstack()的地址，所以ebp保存了函数栈中的最底层（向下生长，所以是最底层）的地址
 
 ```
 (gdb) info stack
@@ -391,9 +391,175 @@ $5 = (void *) 0xf010ffd8
 0xf010fff8:	0x00000000	0xf010003e	0x00000003	0x00001003
 ```
 
+## Exercise11、stackTrace实现
+
+```c
+int
+mon_backtrace(int argc, char **argv, struct Trapframe *tf)
+{
+	// Your code here.
+	//use the sentence directly,to get ebp, otherwise use read_ebp()
+	//asm volatile("movl %%ebp,%0" : "=r" (ebp));
+	uint32_t* ebp = (uint32_t*)read_ebp();
+	//one ebp will show a 32bit,so convert to uint_32t*
+	cprintf("Stack backtrace:\r\n");
+	while(ebp){
+		//as the stack descend, the args was be pushed,so the first five will just after(on) the eip
+		cprintf("  ebp %08x  eip %08x  args %08x %08x %08x %08x %08x\r\n",ebp,ebp[1],ebp[2],ebp[3],ebp[4],ebp[5],ebp[6]);
+		ebp = (uint32_t*)*ebp;
+	}
+	return 0;
+}
+```
+
+这里通过获取到的ebp向上（栈向下生长）获取到之前压栈进入的返回地址和传入的参数
+
+这里我们重新来看一下函数的调用：
+
+函数被调用时，操作系统会分给其一个栈帧（类似于一个内存区），这个栈帧的底地址（其实应该是在内存的上方）需要一个变量来记录他，当然这里就不是变量了，就是寄存器——ebp了。所以通过ebp就可以访问到栈帧中的其他位置。
+
+更详细的说，ebp作为当前栈帧的地址，而地址中保存的则是上一个栈帧的地址，所以最后可以通过`ebp=*ebp`的方式来访问到上一个栈帧。
+
+这里可以参考一下，ebp和esp的关系即函数在调用时都做了什么来加深理解
+
+*在函数调用过程中，`EBP`（基指针寄存器）用于保存当前函数的栈帧信息。其变化过程通常包括以下几个步骤：*
+
+1. ***保存旧的基指针**：*
+   - *当一个函数被调用时，首先会将当前的 `EBP` 值保存到栈中（也就是调用者函数的EBP）。这是通过 `PUSH EBP` 指令完成的，目的是为了在函数返回时能够恢复调用函数的栈帧。*
+2. ***设置新的基指针**：*
+   - *接下来，新的栈框架会被建立。这时，新的 `EBP` 值会被设置为当前的栈顶指针 `ESP`。使用 `MOV EBP, ESP` 指令将 `ESP` 的值拷贝到 `EBP` 中。*
+3. ***分配局部变量空间**：*
+   - *函数可以在其栈帧中分配空间用于局部变量，这通常通过调整 `ESP` 的值来完成。例如，使用 `SUB ESP, n` 来为局部变量分配 `n` 字节的空间。*
+4. ***函数执行**：*
+   - *函数的代码执行，期间可以通过 `EBP` 来访问参数和局部变量。参数通常通过 `EBP + offset` 来访问，而局部变量则通过 `EBP - offset` 来访问。*
+5. ***恢复旧的基指针**：*
+   - *在函数结束时，首先会恢复 `EBP` 的旧值。这是通过 `MOV ESP, EBP` 和 `POP EBP` 指令完成的，以确保返回到调用函数的栈帧。*
+6. ***返回**：*
+   - *最后，使用 `RET` 指令返回到调用位置。*
+
+以上内容来自gpt。
+
+## Exercise12、提取符号表并打印
+
+```c
+static void
+stab_binsearch(const struct Stab *stabs, int *region_left, int *region_right,
+	       int type, uintptr_t addr)
+```
+
+先对我们要用到的函数做一些解释，这个函数主要功能一句话说完就是：在stab条目中从left到right的左闭右开区间内查找type为‘type’，地址为addr的条目，结果通过left和right带出。
+
+下面开始看题目
+
+对于获取文件名和函数名的函数，都已经写好。下面让我们完成的就是获取行号
+
+查看inc/stab.h可以知道我们要的应该是这样一条text（指令段）的行号
+
+```c
+#define	N_SLINE		0x44	// text segment line number
+```
+
+可以看到，这里已经是对我们的lline，rline初始化完成了，下面我们只要负责用函数找就可以了。
+
+```c
+//152行起
+if (lfun <= rfun) {
+		// stabs[lfun] points to the function name
+		// in the string table, but check bounds just in case.
+		if (stabs[lfun].n_strx < stabstr_end - stabstr)
+			info->eip_fn_name = stabstr + stabs[lfun].n_strx;
+		info->eip_fn_addr = stabs[lfun].n_value;
+		addr -= info->eip_fn_addr;
+		// Search within the function definition for the line number.
+		lline = lfun;
+		rline = rfun;
+	} else {
+		// Couldn't find function stab!  Maybe we're in an assembly
+		// file.  Search the whole file for the line number.
+		info->eip_fn_addr = addr;
+		lline = lfile;
+		rline = rfile;
+	}
+```
+
+```c
+	stab_binsearch(stabs, &lline, &rline, N_SLINE, addr);
+	if (lline<=rline)
+	{
+		info->eip_line = stabs[lline].n_desc;
+	}
+	else
+	{
+		info->eip_line = 0;
+		return -1;
+	}
+```
+
+上面使用提供的函数找到lline和rline，如果找到了，取他的n_desc域，也即为行号
+
+到这里，info这个结构体就算是填充完成了。然后就可以修改打印信息了
+
+```c
+int
+mon_backtrace(int argc, char **argv, struct Trapframe *tf)
+{
+	// Your code here.
+	//use the sentence directly,to get ebp, otherwise use read_ebp()
+	//asm volatile("movl %%ebp,%0" : "=r" (ebp));
+	uint32_t* ebp = (uint32_t*)read_ebp();
+	uint32_t eip = ebp[1];
+	//one ebp will show a 32bit,so convert to uint_32t*
+
+	cprintf("Stack backtrace:\r\n");
+
+	while(ebp){
+		//as the stack descend, the args was be pushed,so the first five will just after(on) the eip
+		cprintf("  ebp %08x  eip %08x  args %08x %08x %08x %08x %08x\r\n",ebp,eip,ebp[2],ebp[3],ebp[4],ebp[5],ebp[6]);
+		
+		struct Eipdebuginfo info;
+		if (debuginfo_eip(eip,&info) == -1){
+			cprintf("can't find the info about this addr:%08x\r\n",eip);
+			return 0;
+		}
+
+		cprintf("    %s:%d: %.*s+%d\r\n",info.eip_file, info.eip_line, info.eip_fn_namelen, info.eip_fn_name, eip-info.eip_fn_addr);
+
+		ebp = (uint32_t*)*ebp;
+		eip = ebp[1];
+	}
 
 
+	return 0;
+}
+```
+
+这里，每次循环中都要得到eip的值，进而得到info结构体。这样之后，mon_backtrace函数就完成了，现在运行，就可以得到输出结果了。
+
+最后将它作为cmd加入，在commands结构体中添加
+
+```c
+static struct Command commands[] = {
+	{ "help", "Display this list of commands", mon_help },
+	{ "kerninfo", "Display information about the kernel", mon_kerninfo },
+	{ "backtrace", "Trace back call stack", mon_backtrace },
+};
+```
+
+这样该练习就算是全部结束。make grade全部OK
 
 # summary
+
 ## 启动过程
 
+从part1到part3，总体介绍了PC在按下开机键瞬间，计算机做了什么，又要做什么，来实现正常运行。
+
+首先是BIOS，BIOS主要负责初始化配置一些最基础的硬件及IO设备，同时去扫描第一个可以接触到的硬盘设备，寻找第一个可以作为启动盘的盘块（我们现在常常把c盘作为启动盘一样），这里的可以作为，主要是通过盘块中设置的标志来判定
+
+之后，系统将由bootloader接管，bootloader通过硬布线的方式载入到内存中，所以它载入的物理地址是不会变的，即使我们修改了他的makefile。bootloader主要完成两个工作
+
+- 其一是将cpu运行模式从实模式转换为保护模式，主要的一个区别是虚拟内存的加入
+- 其二是将操作系统内核从硬盘上载入
+
+完成上两步之后，设备将由操作系统接管。
+
+最后，我们从加载到内存中的entry.S进入内核，开始内核的加载，夸张的说，这是启动过程中所需要的最后一个汇编文件。在这里我们要建立虚存，做内存的映射等工作。在本lab中主要是对栈和控制台输出相关做了工作。
