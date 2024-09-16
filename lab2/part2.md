@@ -125,8 +125,7 @@ pgdir_walk(pde_t *pgdir, const void *va, int create)
 			//fail to alloc
 			return NULL;
 		}
-		//get the index of the new page table
-		*pte = (pte_t*)page2kva(pi);
+		pte = (pte_t*)page2kva(pi);
 		pi->pp_ref++;
 		*pde = PADDR(pte) | PTE_U | PTE_W | PTE_P;
 	}
@@ -136,11 +135,15 @@ pgdir_walk(pde_t *pgdir, const void *va, int create)
 
 做几点解释：
 
-- `page2kva`的使用，我们在上一个part中说明过，传入一个PageInfo，返回他所对应的页表索引（由于是右移12位，所以是一级页表索引），且返回的索引是虚拟地址
+- 直接看当没有创建过时，拆开来看：对于二级页表中所存PTE，其实就是每个物理页面的起始地址，offset来自va的低12位，但是我们这里只要得到pte即可，所以对于这个offset并不感兴趣；同时这里让PTE指向每个页面所对应的虚拟地址，这也就看成了一种将这里开始的页面分配给了二级页表；（用更夸张的说法，几乎所有的内存现在都是分配给每个指针的，所以掌控权完全交给程序员）
+
+- `page2kva`的使用，我们在上一个part中说明过，传入一个PageInfo，返回一张物理页面所对应的虚拟地址。
 
 - `*pde = PADDR(pte) | PTE_U | PTE_W | PTE_P`,这句代码，我们在说到part1中的`mem_int`时有提到`kern_pgdir[PDX(UVPT)] = PADDR(kern_pgdir) | PTE_U | PTE_P`，也即建立起和物理地址之间的映射
 
   可以再重新理解一下映射，映射其实不是一件很高级的事，映射的本质是地址的对映，或者说是通过MMU的地址的变换，而这个映射的关系通过页表来解释，所以这里的这句代码，就是**将物理地址包括标志位存入页表项中**，这就完成了映射。
+  
+- 还有一件事，很重要！！！在`pgdir_walk`中，其实只建立了一个映射关系，这个映射是页目录（一级页表）和页面索引（二级页表）中的关系。
 
 ## boot_map_region
 
@@ -158,7 +161,7 @@ boot_map_region(pde_t *pgdir, uintptr_t va, size_t size, physaddr_t pa, int perm
 			//it must panic from alloc_page
 			panic("out of memory!!!\r\n");
 		}
-		*pte = PADDR(pa) | perm | PTE_P;
+		*pte = pa | perm | PTE_P;
 		va += PGSIZE;
 		pa += PGSIZE; 
 	}
@@ -168,3 +171,101 @@ boot_map_region(pde_t *pgdir, uintptr_t va, size_t size, physaddr_t pa, int perm
 这里由于注释中说到，size是PGSIZE的倍数，那么直接除以就行，得到的就是所需要的pages数
 
 使用pgdir_walk，获取到这张页面的pte，之后，再对其中的映射进行修改就行，还是记住，映射在这里就是对pte的地址的修改。基址由KERNBASE提供
+
+## page_lookup
+
+该函数的作用是找到va所对应的pte，并将结果返回给pte_store，同时返回一个指向这个页面的PageInfo
+
+```c
+struct PageInfo *
+page_lookup(pde_t *pgdir, void *va, pte_t **pte_store)
+{
+	// the pte is the PTE of the last level page
+	pte_t* pte = (pte_t*)pgdir_walk(pgdir,va,0);
+	if(!pte) return NULL;
+	if(pte_store) *pte_store = pte;
+
+	if(*pte & PTE_P){
+		return pa2page(PTE_ADDR(*pte));
+	}
+	else return NULL;
+}
+```
+
+通过pgdir_walk获取到最后一级页表的PTE，这时根据注释中的要求，进行一下检查。
+
+最后一步，通过pa2page获取到对应页面的info。这里我们引入一个概念PFN（物理页框号），这个变量对应着物理页面的起始地址（或者说二者直接关联）。而在最后一级的PTE中储存的也就是这个PFN，所以，通过操作它，就可以从我们之前储存的`pages`数组中获取到对应info。
+
+这里有一点，我没有搞懂；通过查看源代码`PTE_ADDR()`就是将pte的地址低12位清零，然后再去右移12位。但是如果直接右移难道不是也可以吗，这点我没有明白
+
+## page_remove
+
+首先，我们先设想一下正常情况下，我们使用这个函数的场景：我们要取消这个页面和物理页面之间的映射——也即清除pte中的值，这点我们在`pgdir_walk中有提到映射的具体含义.
+
+不仅如此，取消虚拟页面对物理页面的映射，写到这里，这个lab的很多数据结构就更加清晰了，`pages`中的每个`info`对应了每一个物理页面，所以我们在循环中才能一个个向下去连接，同时去除部分。而info中的`pp_ref`就是有多少虚拟页面正在指向我（物理页面），而一个info对应了一个物理页面，所以这些虚拟页面是不同的，但都指向了一个相同的物理页面
+
+```c
+void
+page_remove(pde_t *pgdir, void *va)
+{
+	pte_t* pte;
+	struct PageInfo* pi = page_lookup(pgdir,va,&pte);
+	if(!pi) return;
+	page_decref(pi);
+	*pte = 0;
+	tlb_invalidate(pgdir,va);
+}
+```
+
+首先就是用page_lookup获取到对应pte，然后这里使用`page_decref`来完成引用的减减操作，避免重复的造轮子。
+
+额外说明一下最后一句：`tlb_invalidate(pgdir,va);`
+
+这句代码完成的工作，就对应了注释中的*The TLB must be invalidated if you remove an entry from the page table.*  TLB是类似于cache一样，将常用到的页表的pte直接放在和cache一样的地方。这句代码，对应到最后是一句内联汇编	`asm volatile("invlpg (%0)" : : "r" (addr) : "memory");`，invlpg就是负责清除TLB中地址为addr的页表项。
+
+## page_insert
+
+```c
+int
+page_insert(pde_t *pgdir, struct PageInfo *pp, void *va, int perm)
+{
+	//first get the pte of va and store in the *pte
+	pte_t* pte = pgdir_walk(pgdir,va,1);
+	if(!pte){
+		return -E_NO_MEM;
+	}
+	//must in the front of remove
+	pp->pp_ref++;
+	if(*pte & PTE_P){
+		//here is already a page
+		page_remove(pgdir, va);
+	}
+	*pte = page2pa(pp) | perm | PTE_P;
+	return 0;
+}
+```
+
+`page_insert`也即将一张物理页面`pp`映射到虚拟地址`va`上，所以先找到这个虚拟地址对应的pte，如果这个虚拟地址已经存在映射，那么就释放这个映射（不允许一个虚拟地址映射多个物理页面上），特别说明，这里的`ref`必须在判断之前进行加一操作，因为，如果不立即执行，若是进入了`page_remove`，使得ref减到0，就会导致该页面被释放。
+
+这里拓展联系一下Linux下的”写时复制“，在父进程创建子进程的时候，如果只是对父进程的内容进行读取，那么就没有必要给子进程分配新的页面，当且仅当子进程要修改他原有的虚拟页面时（虚拟页面确实是实际不存在的，其实就是带有offset的物理页面），内核就会给他分配一个新的物理页面，并将原有的物理页面对他标记成只读（当然，之前也是只读），同时，操作系统更新子进程的页表，不再是共享页面。所以说，这时候，他们的虚拟地址就不一样了。也即，不能让一个虚拟地址指向多个物理页面。
+
+最后将这个pte中写入物理页面所对应的地址。如此之后，就完成了我们在`pgdir_walk`中留下的问题，二级页表中的pte并没有真正映射到物理地址上，我们只通过`pgdir_walk`找到了，该存放pte的虚拟地址。
+
+## success
+
+到这里做完之后，进行make grade就可以得到如下的输出了
+
+```shell
+  Page management: OK 
+```
+
+# 总结
+
+这一个part主要说明了页面管理的主要流程，并用二级页表来做了编写。
+
+完成一个页面管理，主要三个流程——页面内存分配，多级页表的创建，页面的释放
+
+- 对于页面内存分配，通过上一part完成的`page_alloc`可以获取到一个free page，获取到一个物理页面
+- 多级页表的创建时本part的一个重点：首先通过`pgdir_walk`，创建了一级页表也即页目录到二级页表也即页索引的映射，如此之后，通过pde就可以访问到pte了。而pte到物理页面的映射完成在`page_insert`中才实现。
+- 页面的释放，主要由两个过程组成，一个是基础的`page_free`，一个是物理地址映射的解除`page_remove`.二者共同完成对页面的释放
+
